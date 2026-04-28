@@ -30,6 +30,8 @@ Each project should live under:
     3. Prepare Dataset
     4. Train LoRA
     5. Generate Images
+- `COLAB_GUIDE.md`
+  - Step-by-step Chinese usage guide for first-time setup and daily workflow.
 
 ## Colab Usage
 
@@ -47,3 +49,9 @@ Then run the cells in order.
 - This version does not render card frames.
 - Output is PNG images only.
 - Each project trains and uses its own LoRA.
+
+## Start Here
+
+If this is your first time using the Colab version, read:
+
+- `COLAB_GUIDE.md`
