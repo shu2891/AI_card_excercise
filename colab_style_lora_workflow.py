@@ -15,6 +15,7 @@ REPO_URL = "https://github.com/shu2891/AI_card_excercise.git"
 DRIVE_ROOT = "/content/drive/MyDrive/AI_Card_Project"
 WORKSPACE_ROOT = "/content/AI_Card_Project/workspace"
 VENDOR_ROOT = "/content/AI_Card_Project/vendor"
+RUNTIME_ROOT = "/content/AI_Card_Project/runtime"
 
 STYLE_TOKEN = "fishseriesstyle"
 TRIGGER_PHRASE = "fish series style"
@@ -49,6 +50,11 @@ class ProjectPaths:
     output_dir: Path
     repo_dir: Path
     vendor_dir: Path
+    runtime_root: Path
+    runtime_dir: Path
+    runtime_dataset_dir: Path
+    runtime_lora_dir: Path
+    runtime_output_dir: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,13 +130,18 @@ def clone_diffusers_examples(vendor_dir: Path) -> Path:
     diffusers_dir = vendor_dir / "diffusers"
     vendor_dir.mkdir(parents=True, exist_ok=True)
     if not diffusers_dir.exists():
-        subprocess.check_call(["git", "clone", "--depth", "1", "https://github.com/huggingface/diffusers.git", str(diffusers_dir)])
+        subprocess.check_call(
+            ["git", "clone", "--depth", "1", "https://github.com/huggingface/diffusers.git", str(diffusers_dir)]
+        )
     return diffusers_dir
 
 
 def ensure_repo_imports(repo_dir: Path) -> None:
     src_dir = repo_dir / "src"
+    repo_str = str(repo_dir)
     src_str = str(src_dir)
+    if repo_str not in sys.path:
+        sys.path.insert(0, repo_str)
     if src_str not in sys.path:
         sys.path.insert(0, src_str)
 
@@ -140,12 +151,15 @@ def resolve_project_paths(
     drive_root: str = DRIVE_ROOT,
     workspace_root: str = WORKSPACE_ROOT,
     vendor_root: str = VENDOR_ROOT,
+    runtime_root: str = RUNTIME_ROOT,
     repo_url: str = REPO_URL,
 ) -> ProjectPaths:
     base_dir = Path(drive_root) / project_name
     repo_name = Path(repo_url).stem or "AI_card_excercise"
     repo_dir = Path(workspace_root) / repo_name
     vendor_dir = Path(vendor_root)
+    runtime_root_path = Path(runtime_root)
+    runtime_dir = runtime_root_path / project_name
     return ProjectPaths(
         project_name=project_name,
         base_dir=base_dir,
@@ -155,11 +169,31 @@ def resolve_project_paths(
         output_dir=base_dir / "outputs",
         repo_dir=repo_dir,
         vendor_dir=vendor_dir,
+        runtime_root=runtime_root_path,
+        runtime_dir=runtime_dir,
+        runtime_dataset_dir=runtime_dir / "dataset",
+        runtime_lora_dir=runtime_dir / "lora",
+        runtime_output_dir=runtime_dir / "outputs",
     )
 
 
 def ensure_project_dirs(paths: ProjectPaths) -> None:
-    for path in (paths.base_dir, paths.source_dir, paths.dataset_dir, paths.lora_dir, paths.output_dir):
+    for path in (
+        paths.base_dir,
+        paths.source_dir,
+        paths.dataset_dir,
+        paths.lora_dir,
+        paths.output_dir,
+        paths.runtime_root,
+        paths.runtime_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def reset_runtime_dirs(paths: ProjectPaths) -> None:
+    for path in (paths.runtime_dataset_dir, paths.runtime_lora_dir, paths.runtime_output_dir):
+        if path.exists():
+            shutil.rmtree(path)
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -209,19 +243,41 @@ def _build_style_caption(style_token: str, trigger_phrase: str, species: str, st
     return ", ".join(part for part in parts if part)
 
 
+def _safe_target_name(source_root: Path, source_path: Path) -> str:
+    relative = source_path.relative_to(source_root)
+    stem_parts = list(relative.with_suffix("").parts)
+    flat_stem = "__".join(stem_parts)
+    return f"{flat_stem}{source_path.suffix.lower()}"
+
+
+def _sync_tree(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for item in source.rglob("*"):
+        relative = item.relative_to(source)
+        target = destination / relative
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+
+
 def prepare_style_dataset(
     source_dir: str | Path,
     dataset_dir: str | Path,
     style_token: str,
     trigger_phrase: str,
     repeats: int = REPEATS,
+    runtime_dataset_dir: str | Path | None = None,
+    sync_to_drive: bool = True,
 ) -> list[StyleDatasetRecord]:
     source_dir = Path(source_dir).expanduser().resolve()
     dataset_dir = Path(dataset_dir).expanduser().resolve()
-    image_dir = dataset_dir / "images"
+    runtime_dataset_dir = Path(runtime_dataset_dir).expanduser().resolve() if runtime_dataset_dir else dataset_dir
 
-    if dataset_dir.exists():
-        shutil.rmtree(dataset_dir)
+    image_dir = runtime_dataset_dir / "images"
+    if runtime_dataset_dir.exists():
+        shutil.rmtree(runtime_dataset_dir)
     image_dir.mkdir(parents=True, exist_ok=True)
 
     source_files = list(_iter_source_images(source_dir))
@@ -229,18 +285,25 @@ def prepare_style_dataset(
         raise ValueError(f"No image files found under {source_dir}")
 
     records: list[StyleDatasetRecord] = []
-    metadata_path = dataset_dir / "metadata.jsonl"
+    metadata_path = runtime_dataset_dir / "metadata.jsonl"
     with metadata_path.open("w", encoding="utf-8") as metadata_file:
         for source_path in source_files:
             species, status = _parse_source_tags(source_path, source_dir)
             caption = _build_style_caption(style_token, trigger_phrase, species, status)
-            for repeat_index in range(max(1, int(repeats))):
-                suffix = f"_{repeat_index:02d}" if repeats > 1 else ""
-                target_name = f"{source_path.stem}{suffix}{source_path.suffix.lower()}"
-                target_path = image_dir / target_name
-                shutil.copy2(source_path, target_path)
-                metadata_file.write(json.dumps({"file_name": f"images/{target_name}", "text": caption}, ensure_ascii=False) + "\n")
+            target_name = _safe_target_name(source_dir, source_path)
+            target_path = image_dir / target_name
+            shutil.copy2(source_path, target_path)
+            relative_name = f"images/{target_name}"
+
+            for _ in range(max(1, int(repeats))):
+                metadata_file.write(json.dumps({"file_name": relative_name, "text": caption}, ensure_ascii=False) + "\n")
                 records.append(StyleDatasetRecord(source_path=source_path, target_path=target_path, caption=caption))
+
+    if sync_to_drive and runtime_dataset_dir != dataset_dir:
+        if dataset_dir.exists():
+            shutil.rmtree(dataset_dir)
+        _sync_tree(runtime_dataset_dir, dataset_dir)
+
     return records
 
 
@@ -265,11 +328,23 @@ def train_style_lora(
     mixed_precision: str = MIXED_PRECISION,
     resume_from_checkpoint: str | None = None,
     initial_lora_weights_path: str | None = None,
+    sync_to_drive: bool = True,
 ) -> Path:
     diffusers_dir = clone_diffusers_examples(paths.vendor_dir)
     train_script = diffusers_dir / "examples" / "text_to_image" / "train_text_to_image_lora_sdxl.py"
-    output_dir = paths.lora_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if not train_script.exists():
+        raise FileNotFoundError(f"Training script not found: {train_script}")
+
+    if not (paths.runtime_dataset_dir / "metadata.jsonl").exists():
+        if not (paths.dataset_dir / "metadata.jsonl").exists():
+            raise FileNotFoundError("metadata.jsonl not found. Run prepare_style_dataset() first.")
+        if paths.runtime_dataset_dir.exists():
+            shutil.rmtree(paths.runtime_dataset_dir)
+        _sync_tree(paths.dataset_dir, paths.runtime_dataset_dir)
+
+    if paths.runtime_lora_dir.exists() and not resume_from_checkpoint and not initial_lora_weights_path:
+        shutil.rmtree(paths.runtime_lora_dir)
+    paths.runtime_lora_dir.mkdir(parents=True, exist_ok=True)
 
     command = [
         sys.executable,
@@ -279,7 +354,7 @@ def train_style_lora(
         "--pretrained_model_name_or_path",
         base_model,
         "--train_data_dir",
-        str(paths.dataset_dir),
+        str(paths.runtime_dataset_dir),
         "--resolution",
         str(resolution),
         "--center_crop",
@@ -298,7 +373,7 @@ def train_style_lora(
         "--rank",
         str(rank),
         "--output_dir",
-        str(output_dir),
+        str(paths.runtime_lora_dir),
         "--mixed_precision",
         mixed_precision,
         "--report_to",
@@ -316,7 +391,13 @@ def train_style_lora(
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONPATH"] = str(paths.repo_dir / "src")
     subprocess.check_call(command, env=env)
-    return output_dir
+
+    if sync_to_drive:
+        if paths.lora_dir.exists():
+            shutil.rmtree(paths.lora_dir)
+        _sync_tree(paths.runtime_lora_dir, paths.lora_dir)
+
+    return paths.runtime_lora_dir
 
 
 def latest_lora_path(lora_dir: str | Path) -> Path:
@@ -340,11 +421,15 @@ def generate_images(
     width: int = WIDTH,
     height: int = HEIGHT,
     lora_scale: float = LORA_SCALE,
+    runtime_output_dir: str | Path | None = None,
+    sync_to_drive: bool = True,
 ) -> list[Path]:
     from local_stagegen.ai_card_renderer import generate_raw_lora_images
 
     output_dir = Path(output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    runtime_output_dir = Path(runtime_output_dir).expanduser().resolve() if runtime_output_dir else output_dir
+    runtime_output_dir.mkdir(parents=True, exist_ok=True)
+
     images = generate_raw_lora_images(
         prompt=prompt,
         seed=seed,
@@ -358,9 +443,16 @@ def generate_images(
 
     saved_paths: list[Path] = []
     for index, image in enumerate(images):
-        out_path = output_dir / f"generated_{seed}_{index:02d}.png"
+        out_path = runtime_output_dir / f"generated_{seed}_{index:02d}.png"
         image.save(out_path)
         saved_paths.append(out_path)
+
+    if sync_to_drive and runtime_output_dir != output_dir:
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        _sync_tree(runtime_output_dir, output_dir)
+        return [output_dir / path.name for path in saved_paths]
+
     return saved_paths
 
 
@@ -378,6 +470,7 @@ def main(
 
     paths = resolve_project_paths(project_name=project_name)
     ensure_project_dirs(paths)
+    reset_runtime_dirs(paths)
     clone_repo(REPO_URL, paths.repo_dir)
     ensure_repo_imports(paths.repo_dir)
 
@@ -387,13 +480,15 @@ def main(
         style_token=STYLE_TOKEN,
         trigger_phrase=TRIGGER_PHRASE,
         repeats=REPEATS,
+        runtime_dataset_dir=paths.runtime_dataset_dir,
+        sync_to_drive=True,
     )
     dataset_summary = summarize_style_dataset(records)
 
     if not skip_train:
-        train_style_lora(paths=paths)
+        train_style_lora(paths=paths, sync_to_drive=True)
 
-    active_lora = latest_lora_path(paths.lora_dir)
+    active_lora = latest_lora_path(paths.runtime_lora_dir if paths.runtime_lora_dir.exists() else paths.lora_dir)
     saved_images = generate_images(
         prompt=prompt,
         seed=seed,
@@ -404,6 +499,8 @@ def main(
         width=WIDTH,
         height=HEIGHT,
         lora_scale=LORA_SCALE,
+        runtime_output_dir=paths.runtime_output_dir,
+        sync_to_drive=True,
     )
 
     result = {
@@ -413,6 +510,9 @@ def main(
         "dataset_dir": str(paths.dataset_dir),
         "lora_dir": str(paths.lora_dir),
         "output_dir": str(paths.output_dir),
+        "runtime_dataset_dir": str(paths.runtime_dataset_dir),
+        "runtime_lora_dir": str(paths.runtime_lora_dir),
+        "runtime_output_dir": str(paths.runtime_output_dir),
         "active_lora": str(active_lora),
         "dataset_summary": dataset_summary,
         "generated_images": [str(path) for path in saved_images],
